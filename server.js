@@ -25,7 +25,17 @@ app.use(express.json());
 
 // === КЛЮЧОВІ ДАНІ (ЧИТАЮТЬСЯ З .env) ===
 // Використовуємо .trim() для видалення зайвих пробілів (що викликало попередню помилку)
-const PRIVATE_KEY = process.env.PRIVATE_KEY.trim();
+// server.js
+
+// Перевіряємо, чи існує змінна, перед тим як викликати .trim()
+const PRIVATE_KEY = process.env.PRIVATE_KEY ? process.env.PRIVATE_KEY.trim() : null; 
+
+if (!PRIVATE_KEY) {
+    console.error("FATAL ERROR: PRIVATE_KEY is not set in Render Environment Variables!");
+    // Додамо вихід із процесу, щоб чітко бачити помилку
+    process.exit(1); 
+}
+// ... (решта коду)
 const CONTRACT_ADDRESS = '0x98065B24753198F4C9d543473510A8edaF438b56'; 
 
 const CONTRACT_ABI = [
