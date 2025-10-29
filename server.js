@@ -7,38 +7,32 @@ const cors = require('cors');
 const express = require('express');
 const { ethers } = require('ethers');
 
-// Використовуємо NeDB для простого збереження часу нагородження
+// Використовуємо Nedb для CoolDown та Рефералів
 const Datastore = require('nedb'); 
 
 const app = express();
 const port = 3000;
 
 // === ІНІЦІАЛІЗАЦІЯ БАЗИ ДАНИХ ТА COOLDOWN ===
-const db = new Datastore({ filename: 'cooldowns.db', autoload: true });
+const cooldownDB = new Datastore({ filename: 'cooldowns.db', autoload: true }); // Для ліміту часу
+const referralDB = new Datastore({ filename: 'referrals.db', autoload: true }); // Для реферальних зв'язків
 
 // Обмеження нагороди: 1 година (в мілісекундах)
 const REWARD_COOLDOWN_MS = 1000 * 60 * 60 * 1; 
 
-// 2. ВИКОРИСТОВУЄМО CORS та JSON
+// Параметри економіки
+const SCORE_THRESHOLD = 50;
+const REWARD_AMOUNT = 1;
+const REFERRAL_BONUS_PERCENT = 0.1; // 10% бонусу
+
 app.use(cors()); 
 app.use(express.json()); 
 
-// === КЛЮЧОВІ ДАНІ (ЧИТАЮТЬСЯ З .env) ===
-// Використовуємо .trim() для видалення зайвих пробілів (що викликало попередню помилку)
-// server.js
-
-// Перевіряємо, чи існує змінна, перед тим як викликати .trim()
-const PRIVATE_KEY = process.env.PRIVATE_KEY ? process.env.PRIVATE_KEY.trim() : null; 
-
-if (!PRIVATE_KEY) {
-    console.error("FATAL ERROR: PRIVATE_KEY is not set in Render Environment Variables!");
-    // Додамо вихід із процесу, щоб чітко бачити помилку
-    process.exit(1); 
-}
-// ... (решта коду)
+// === КЛЮЧОВІ ДАНІ ===
+const PRIVATE_KEY = process.env.PRIVATE_KEY ? process.env.PRIVATE_KEY.trim() : null;
 const CONTRACT_ADDRESS = '0x98065B24753198F4C9d543473510A8edaF438b56'; 
-
 const CONTRACT_ABI = [
+  // ... (Ваші ABI)
   {
     "type": "constructor",
     "inputs": [{"name": "initialOwner", "type": "address", "internalType": "address"}],
@@ -63,12 +57,16 @@ const CONTRACT_ABI = [
   }
 ];
 
-const RPC_URL = process.env.RPC_URL;
+if (!PRIVATE_KEY) {
+    console.error("FATAL ERROR: PRIVATE_KEY is not set in Environment Variables!");
+    process.exit(1); 
+}
 
-// === ІНІЦІАЛІЗАЦІЯ ETHERS ===
+const RPC_URL = process.env.RPC_URL;
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const signer = new ethers.Wallet(PRIVATE_KEY, provider);
 const tokenContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+
 
 // =========================================================================
 //                  API ENDPOINT 1: ЗЧИТУВАННЯ БАЛАНСУ
@@ -76,15 +74,13 @@ const tokenContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer
 
 app.get('/api/balance/:walletAddress', async (req, res) => {
     const playerWallet = req.params.walletAddress;
-
+    // ... (той самий код для перевірки балансу)
     if (!ethers.isAddress(playerWallet)) {
         return res.status(400).json({ message: 'Invalid player wallet address.' });
     }
 
     try {
         const balanceBigInt = await tokenContract.balanceOf(playerWallet);
-
-        // ВИПРАВЛЕНО: Використовуємо 18 decimals для коректного відображення балансу
         const balance = ethers.formatUnits(balanceBigInt, 18); 
         
         console.log(`Checking balance for ${playerWallet}: ${balance} DOODLE`);
@@ -100,8 +96,45 @@ app.get('/api/balance/:walletAddress', async (req, res) => {
     }
 });
 
+
+// ========================================================
+//          API ENDPOINT 2: ЗВ'ЯЗУВАННЯ РЕФЕРАЛА
+// ========================================================
+app.post('/api/link-referrer', async (req, res) => {
+    const { referralWallet, referrerCode } = req.body;
+
+    if (!referralWallet || !referrerCode) {
+        return res.status(400).send({ message: "Referral wallet and referrer code are required." });
+    }
+
+    // Реферальний код - це останні 8 символів гаманця реферера
+    // Ми припускаємо, що код має бути розширений до повної адреси 0x...
+    const referrerWallet = '0x' + referrerCode;
+
+    if (referralWallet.toLowerCase() === referrerWallet.toLowerCase()) {
+         return res.status(400).send({ message: "Cannot refer yourself." });
+    }
+
+    // Перевіряємо, чи цей гравець вже не має реферера
+    referralDB.findOne({ referralWallet }, (err, doc) => {
+        if (err) return res.status(500).send({ message: "Database error." });
+        
+        if (doc) {
+            return res.status(200).send({ message: "Referrer already linked." });
+        }
+
+        // Зберігаємо новий зв'язок
+        referralDB.insert({ referralWallet, referrerWallet, linkedAt: new Date() }, (err, newDoc) => {
+            if (err) return res.status(500).send({ message: "Database error on insert." });
+            console.log(`New referral link: ${referralWallet} linked by ${referrerWallet}`);
+            res.status(200).send({ message: "Referrer linked successfully." });
+        });
+    });
+});
+
+
 // =========================================================================
-//                   API ENDPOINT 2: НАГОРОДЖЕННЯ З COOLDOWN
+//          API ENDPOINT 3: НАГОРОДЖЕННЯ З COOLDOWN ТА РЕФЕРАЛОМ
 // =========================================================================
 
 app.post('/api/reward', async (req, res) => {
@@ -111,13 +144,13 @@ app.post('/api/reward', async (req, res) => {
     if (!ethers.isAddress(playerWallet)) {
         return res.status(400).json({ message: 'Invalid player wallet address.' });
     }
-    if (!score || score < 50) { 
-        return res.status(400).json({ message: 'Invalid request or score too low (min 50 required).' });
+    if (!score || score < SCORE_THRESHOLD) { 
+        return res.status(400).json({ message: `Score too low (min ${SCORE_THRESHOLD} required).` });
     }
 
     // === 2. ПЕРЕВІРКА COOLDOWN ===
     const lastReward = await new Promise((resolve, reject) => {
-        db.findOne({ wallet: playerWallet }, (err, doc) => {
+        cooldownDB.findOne({ wallet: playerWallet }, (err, doc) => {
             if (err) return reject(err);
             resolve(doc);
         });
@@ -126,15 +159,11 @@ app.post('/api/reward', async (req, res) => {
     const now = Date.now();
     
     if (lastReward) {
-        const lastTime = lastReward.timestamp;
-        const timeElapsed = now - lastTime;
+        const timeElapsed = now - lastReward.timestamp;
 
         if (timeElapsed < REWARD_COOLDOWN_MS) {
             const timeLeftSeconds = Math.ceil((REWARD_COOLDOWN_MS - timeElapsed) / 1000);
-            
-            console.log(`Cooldown active for ${playerWallet}. Time left: ${timeLeftSeconds}s`);
-            
-            return res.status(429).json({ // 429: Too Many Requests
+            return res.status(429).json({ 
                 success: false, 
                 message: `Reward cooldown active. Try again in ${Math.ceil(timeLeftSeconds / 60)} minutes.`
             });
@@ -144,32 +173,52 @@ app.post('/api/reward', async (req, res) => {
 
 
     try {
-        const rewardAmount = 1;
+        let response = { success: true, message: 'Reward processed.', awardedToReferral: REWARD_AMOUNT };
 
-        console.log(`Rewarding ${playerWallet} with ${rewardAmount} DOODLE for score ${score}...`);
-
-        // 3. Відправка транзакції
-        const tx = await tokenContract.mintReward(
+        // 3. Карбування ОСНОВНОЇ нагороди
+        const rewardTx = await tokenContract.mintReward(
             playerWallet, 
-            rewardAmount
+            ethers.parseUnits(REWARD_AMOUNT.toString(), 18) // Конвертуємо в BigInt з 18 decimals
         );
-        
-        await tx.wait();
+        await rewardTx.wait();
+        response.rewardTxHash = rewardTx.hash;
 
         // 4. ОНОВЛЕННЯ ЧАСУ В БАЗІ ДАНИХ (після успішної транзакції)
-        db.update(
+        cooldownDB.update(
             { wallet: playerWallet },
             { wallet: playerWallet, timestamp: now },
-            { upsert: true } // Створити, якщо не існує, оновити, якщо існує
+            { upsert: true }
         );
 
-        console.log('Transaction confirmed:', tx.hash);
+        // 5. ПЕРЕВІРКА ТА КАРБУВАННЯ РЕФЕРАЛЬНОГО БОНУСУ
+        referralDB.findOne({ referralWallet: playerWallet }, async (err, doc) => {
+            if (doc && !err) {
+                const { referrerWallet } = doc;
+                const bonusAmount = REWARD_AMOUNT * REFERRAL_BONUS_PERCENT;
+                
+                try {
+                    // Карбування бонусу для реферера
+                    const bonusTx = await tokenContract.mintReward(
+                        referrerWallet, 
+                        ethers.parseUnits(bonusAmount.toString(), 18)
+                    );
+                    await bonusTx.wait();
+                    
+                    console.log(`Referral Bonus: ${bonusAmount} DOODLE sent to ${referrerWallet}`);
+                    
+                    response.awardedToReferrer = bonusAmount;
+                    response.bonusTxHash = bonusTx.hash;
 
-        res.json({
-            success: true,
-            message: `Successfully minted ${rewardAmount} DOODLE to ${playerWallet}`,
-            txHash: tx.hash
+                } catch (bonusError) {
+                    console.error('Error minting referral bonus:', bonusError.message);
+                    // Не повертаємо помилку 500, оскільки основна нагорода вже пройшла
+                }
+            }
+            
+            // Відправка відповіді після всіх асинхронних операцій
+            res.json(response); 
         });
+
 
     } catch (error) {
         console.error('Error minting reward:', error.message);
